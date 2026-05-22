@@ -13,6 +13,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <HTTPClient.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include "time.h"
@@ -88,6 +89,13 @@ typedef struct {
   uint8_t wind_code;
   char wind_dir[16];
   float wind_speed;
+  /* Data dari API */
+  float api_temperature;
+  float api_humidity;
+  float api_wind_speed;
+  uint8_t api_wind_code;
+  char api_wind_dir[16];
+  float api_rain_mm;
 } sensor_msg_t;
 
 QueueHandle_t sensorQueue;
@@ -108,6 +116,22 @@ struct {
   float speed;
   time_t speed_ts;
 } latestWind = {0, "", 0, NAN, 0};
+
+struct {
+  float temperature;
+  float humidity;
+  float wind_speed;
+  uint8_t wind_code;
+  char wind_dir[16];
+  float rain_mm;
+  time_t timestamp;
+} latestAPIReading = {NAN, NAN, NAN, 0, "", 0.0, 0};
+
+/* OpenWeatherMap API */
+const char* API_KEY = "689bd19c7d61c8c14869750378aaa033";
+const float LAT = -8.036446882144972;
+const float LON = 112.73506632854176;
+const char* API_URL = "https://api.openweathermap.org/data/2.5/weather";
 
 /* MQTT */
 const char* mqttServer = "broker.hivemq.com";
@@ -235,6 +259,85 @@ void IRAM_ATTR ISR_countTip() {
     tipCount++;
     lastInterruptTime = now;
   }
+}
+
+/* Fungsi untuk membaca data dari OpenWeatherMap API */
+void getWeatherFromAPI() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[API] WiFi tidak terhubung, skip API call");
+    return;
+  }
+
+  String url = String(API_URL) + "?lat=" + String(LAT, 6) + "&lon=" + String(LON, 6) + 
+               "&appid=" + String(API_KEY) + "&units=metric";
+  
+  Serial.printf("[API] Requesting: %s\n", url.c_str());
+  
+  HTTPClient http;
+  http.begin(url);
+  int httpCode = http.GET();
+  
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.printf("[API] HTTP Error: %d\n", httpCode);
+    http.end();
+    return;
+  }
+  
+  String payload = http.getString();
+  http.end();
+  
+  DynamicJsonDocument doc(1024);
+  DeserializationError error = deserializeJson(doc, payload);
+  
+  if (error) {
+    Serial.printf("[API] JSON parse error: %s\n", error.c_str());
+    return;
+  }
+  
+  if (!doc.containsKey("main") || !doc.containsKey("wind")) {
+    Serial.println("[API] Missing main or wind data in response");
+    return;
+  }
+  
+  float api_temp = doc["main"]["temp"] | NAN;
+  float api_hum = doc["main"]["humidity"] | 0;
+  float api_wind_spd = doc["wind"]["speed"] | NAN;
+  float api_rain = doc["rain"]["1h"] | 0.0;
+  
+  uint8_t api_wcode = 0;
+  char api_wdir[16] = "unknown";
+  
+  // Parse wind direction dari main.deg (derajat)
+  if (doc.containsKey("wind") && doc["wind"].containsKey("deg")) {
+    int deg = doc["wind"]["deg"] | -1;
+    if (deg >= 0) {
+      // Konversi derajat ke arah 8 mata angin
+      if ((deg >= 348.75) || (deg < 11.25)) { api_wcode = 1; strncpy(api_wdir, "utara", sizeof(api_wdir)); }
+      else if (deg < 56.25) { api_wcode = 2; strncpy(api_wdir, "timur laut", sizeof(api_wdir)); }
+      else if (deg < 101.25) { api_wcode = 3; strncpy(api_wdir, "timur", sizeof(api_wdir)); }
+      else if (deg < 146.25) { api_wcode = 4; strncpy(api_wdir, "tenggara", sizeof(api_wdir)); }
+      else if (deg < 191.25) { api_wcode = 5; strncpy(api_wdir, "selatan", sizeof(api_wdir)); }
+      else if (deg < 236.25) { api_wcode = 6; strncpy(api_wdir, "barat daya", sizeof(api_wdir)); }
+      else if (deg < 281.25) { api_wcode = 7; strncpy(api_wdir, "barat", sizeof(api_wdir)); }
+      else if (deg < 326.25) { api_wcode = 8; strncpy(api_wdir, "barat laut", sizeof(api_wdir)); }
+    }
+  }
+  api_wdir[sizeof(api_wdir)-1] = '\0';
+  
+  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+    latestAPIReading.temperature = api_temp;
+    latestAPIReading.humidity = api_hum;
+    latestAPIReading.wind_speed = api_wind_spd;
+    latestAPIReading.wind_code = api_wcode;
+    strncpy(latestAPIReading.wind_dir, api_wdir, sizeof(latestAPIReading.wind_dir));
+    latestAPIReading.wind_dir[sizeof(latestAPIReading.wind_dir)-1] = '\0';
+    latestAPIReading.rain_mm = api_rain;
+    time(&latestAPIReading.timestamp);
+    xSemaphoreGive(dataMutex);
+  }
+  
+  Serial.printf("[API] Updated: temp=%.2f, hum=%.0f, wind=%.2f m/s, dir=%s, rain=%.2f\n",
+                api_temp, api_hum, api_wind_spd, api_wdir, api_rain);
 }
 
 /* Task: Sensor Reader (DHT) */
@@ -377,6 +480,19 @@ void taskWindRS485(void *pvParameters) {
   }
 }
 
+/* Task: API Weather Reader (OpenWeatherMap) */
+void taskAPIWeather(void *pvParameters) {
+  const TickType_t delayTicks = pdMS_TO_TICKS(900000); // 15 menit
+  
+  for (;;) {
+    Serial.println("[API Task] Calling getWeatherFromAPI()");
+    getWeatherFromAPI();
+    
+    // Pertama kali tunggu 2 menit sebelum call berikutnya
+    vTaskDelay(delayTicks);
+  }
+}
+
 /* Task: Aggregator */
 void taskAggregator(void *pvParameters) {
   unsigned long lastSavedTotalTip = 0;
@@ -412,6 +528,13 @@ void taskAggregator(void *pvParameters) {
       uint8_t wcode = 0;
       char wdir[16] = "";
       float wspeed = NAN;
+      
+      /* Data dari API */
+      float api_t = NAN, api_hhum = NAN;
+      float api_wspeed = NAN;
+      uint8_t api_wcode = 0;
+      char api_wdir[16] = "";
+      float api_rain = 0.0;
 
       if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
         t = latestReading.temperature;
@@ -422,6 +545,16 @@ void taskAggregator(void *pvParameters) {
         strncpy(wdir, latestWind.dir, sizeof(wdir));
         wdir[sizeof(wdir)-1] = '\0';
         wspeed = latestWind.speed;
+        
+        /* Copy data API */
+        api_t = latestAPIReading.temperature;
+        api_hhum = latestAPIReading.humidity;
+        api_wspeed = latestAPIReading.wind_speed;
+        api_wcode = latestAPIReading.wind_code;
+        strncpy(api_wdir, latestAPIReading.wind_dir, sizeof(api_wdir));
+        api_wdir[sizeof(api_wdir)-1] = '\0';
+        api_rain = latestAPIReading.rain_mm;
+        
         xSemaphoreGive(dataMutex);
       }
 
@@ -447,6 +580,15 @@ void taskAggregator(void *pvParameters) {
       strncpy(msg.wind_dir, wdir, sizeof(msg.wind_dir));
       msg.wind_dir[sizeof(msg.wind_dir)-1] = '\0';
       msg.wind_speed = wspeed;
+      
+      /* API data */
+      msg.api_temperature = api_t;
+      msg.api_humidity = api_hhum;
+      msg.api_wind_speed = api_wspeed;
+      msg.api_wind_code = api_wcode;
+      strncpy(msg.api_wind_dir, api_wdir, sizeof(msg.api_wind_dir));
+      msg.api_wind_dir[sizeof(msg.api_wind_dir)-1] = '\0';
+      msg.api_rain_mm = api_rain;
 
       if (xQueueSend(sensorQueue, &msg, pdMS_TO_TICKS(1000)) != pdPASS) {
         Serial.println("[Aggregator] Queue penuh, gagal kirim snapshot.");
@@ -455,6 +597,8 @@ void taskAggregator(void *pvParameters) {
         getISOTimeStrFromSec(msg.timestamp, timestr, sizeof(timestr));
         Serial.printf("[Aggregator] Snapshot @%s -> tip_delta=%lu, rain=%.2f mm, rainAO=%d, wind=%u/%s, spd=%.2f\n",
                       timestr, deltaTip, rain_mm_interval, msg.rain_status, msg.wind_code, msg.wind_dir, msg.wind_speed);
+        Serial.printf("            -> API: temp=%.2f, hum=%.0f, wind=%.2f, rain=%.2f\n",
+                      msg.api_temperature, msg.api_humidity, msg.api_wind_speed, msg.api_rain_mm);
       }
 
       /* MQTT publish */
@@ -468,7 +612,7 @@ void taskAggregator(void *pvParameters) {
         strcpy(timestr2, "1970-01-01 00:00:00");
       }
 
-      StaticJsonDocument<256> jsonDoc;
+      StaticJsonDocument<512> jsonDoc;
       jsonDoc["time"] = timestr2;
       if (!isnan(msg.temperature)) jsonDoc["temperature"] = msg.temperature;
       else jsonDoc["temperature"] = nullptr;
@@ -479,8 +623,18 @@ void taskAggregator(void *pvParameters) {
       jsonDoc["wind_dir"] = msg.wind_code;
       jsonDoc["rain_mm"] = msg.rain_mm_interval;
       jsonDoc["rain_status"] = msg.rain_status;
+      
+      /* API fields */
+      if (!isnan(msg.api_temperature)) jsonDoc["api_temperature"] = msg.api_temperature;
+      else jsonDoc["api_temperature"] = nullptr;
+      if (!isnan(msg.api_humidity)) jsonDoc["api_humidity"] = msg.api_humidity;
+      else jsonDoc["api_humidity"] = nullptr;
+      if (!isnan(msg.api_wind_speed)) jsonDoc["api_wind_speed"] = msg.api_wind_speed;
+      else jsonDoc["api_wind_speed"] = nullptr;
+      jsonDoc["api_wind_dir"] = msg.api_wind_code;
+      jsonDoc["api_rain_mm"] = msg.api_rain_mm;
 
-      char payload[256];
+      char payload[512];
       size_t n = serializeJson(jsonDoc, payload, sizeof(payload));
       if (n > 0 && mqttClient.connected()) {
         bool ok = mqttClient.publish(mqttTopic, payload);
@@ -505,7 +659,7 @@ void taskSDWriter(void *pvParameters) {
     if (!SD.exists(logFilename)) {
       File f = SD.open(logFilename, FILE_WRITE);
       if (f) {
-        f.println("time,suhu,humidity,kec. angin,arah angin,curah hujan,raindrop");
+        f.println("time,suhu,humidity,kec. angin,arah angin,curah hujan,raindrop,suhu_api,humidity_api,kec_angin_api,arah_angin_api,curah_hujan_api");
         f.close();
         Serial.println("[SD] Header file dibuat: cuaca_dataset.csv");
       } else {
@@ -530,7 +684,13 @@ void taskSDWriter(void *pvParameters) {
                     String(rcv.wind_speed, 2) + "," +
                     String(rcv.wind_dir) + "," +
                     String(rcv.rain_mm_interval, 2) + "," +
-                    String(rcv.rain_status == 1 ? "hujan" : "tidak");
+                    String(rcv.rain_status == 1 ? "hujan" : "tidak") + "," +
+                    /* API data */
+                    String(rcv.api_temperature, 2) + "," +
+                    String(rcv.api_humidity, 2) + "," +
+                    String(rcv.api_wind_speed, 2) + "," +
+                    String(rcv.api_wind_dir) + "," +
+                    String(rcv.api_rain_mm, 2);
 
       if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
         File f = SD.open(logFilename, FILE_APPEND);
@@ -596,6 +756,12 @@ void setup() {
 
   mqttClient.setServer(mqttServer, mqttPort);
   reconnectMQTT();
+  
+  /* Get initial API data jika WiFi siap */
+  if (WiFi.status() == WL_CONNECTED) {
+    delay(2000);
+    getWeatherFromAPI();
+  }
 
   sntp_set_time_sync_notification_cb(timeavailable);
   esp_sntp_servermode_dhcp(1);
@@ -628,6 +794,8 @@ void setup() {
   if (ok != pdPASS) Serial.println("Gagal buat TaskWindRS485");
   ok = xTaskCreatePinnedToCore(taskAggregator, "TaskAggregator", 4096, NULL, 1, NULL, 1);
   if (ok != pdPASS) Serial.println("Gagal buat TaskAggregator");
+  ok = xTaskCreatePinnedToCore(taskAPIWeather, "TaskAPIWeather", 8192, NULL, 1, NULL, 0);
+  if (ok != pdPASS) Serial.println("Gagal buat TaskAPIWeather");
   ok = xTaskCreatePinnedToCore(taskSDWriter, "TaskSD", 8192, NULL, 1, NULL, 1);
   if (ok != pdPASS) Serial.println("Gagal buat TaskSDWriter");
 
